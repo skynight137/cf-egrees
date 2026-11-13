@@ -6,6 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 : "${CLOUDFLARE_API_TOKEN:?missing - run via replit secrets exec}"
 : "${CLOUDFLARE_ACCOUNT_ID:?missing - run via replit secrets exec}"
+# KV namespace (tokens + cache) must exist first, once:
+#   npx wrangler kv namespace create KV   (same secrets exec)
+# then put its id in wrangler.toml. Deploy refuses to run with the
+# PENDING placeholder still in place.
+grep -q 'id = "PENDING' wrangler.toml && { echo 'KV namespace id missing in wrangler.toml - create it first (see comment above)'; exit 1; }
 [ -d node_modules/wrangler ] || npm install --no-audit --no-fund wrangler@4
 if [ ! -f .proxy-key ]; then
   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))" > .proxy-key
