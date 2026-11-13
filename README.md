@@ -1,18 +1,26 @@
-# cf-egrees — private ?url= fetch proxy (Cloudflare Worker)
+# cf-egress — private `?url=` fetch proxy (Cloudflare Worker)
 
-A private `?url=` fetch proxy running on Cloudflare Workers. One domain
-fronts all shell HTTP egress: clients ask the Worker for a target, the
-Worker fetches it server-side and streams the response back.
+One domain fronts all shell HTTP egress: clients ask the Worker for a
+target, the Worker fetches it server-side and streams the response back.
+Default is a fresh fetch every time; `?cache=` opts into KV caching.
 
-Live: `https://<your-domain>` (Worker name `cf-egress`; `https://cf-egress.skae.workers.dev` also works)
+Live URL: `https://<your-domain>` (Worker `https://<your-worker>.workers.dev`
+also works). Replace both placeholders with your own domain / Worker name.
+
+## Setup
+
+1. `wrangler kv namespace create KV` — put the id in `wrangler.toml`.
+2. `wrangler secret put PROXY_KEY` — the master key (admin).
+3. Attach your domain: `routes = [{ pattern = "<your-domain>", custom_domain = true }]` in `wrangler.toml`.
+4. `wrangler deploy` (or `bash deploy.sh`, which installs wrangler, generates `.proxy-key` if missing, sets `PROXY_KEY`, deploys).
 
 ## Auth — per-user tokens, not one shared key
 
 Like a mail worker: a user creates their own entry, gets a token, and the
 token re-opens their list. Tokens are minted open and self-serve; each
 token only sees its own cached entries, and revoking a token deletes its
-cache with it. Tokens never expire. The master key (`PROXY_KEY` Worker
-secret) is admin: it fetches, lists tokens, and revokes.
+cache with it. Tokens never expire. The master key (`PROXY_KEY`) is admin:
+it fetches, lists tokens, and revokes.
 
 ```sh
 # mint a token (open, self-serve)
@@ -34,8 +42,8 @@ curl -s -X POST -H "X-Proxy-Key: <master>" \
 
 ## Cache — fresh by default, opt-in per request
 
-Default is **always a fresh fetch**. Add `?cache=<seconds>` to cache the
-response in KV for that long, then it is pruned (`expiration_ttl`).
+Add `?cache=<seconds>` to cache the response in KV for that long, then it
+is pruned (`expiration_ttl`).
 
 ```sh
 # cache 600s: first call MISS, next calls HIT until 600s pass
@@ -59,46 +67,31 @@ curl -s -H "X-Proxy-Key: <token>" \
 - Cache is per-token (keyed by a hash of the token), never shared
   between tokens. `GET /health` needs no key.
 
-Other behaviour, as before: SSRF guard (http(s) only; localhost,
-loopback, private ranges, link-local, `.local`, cloud metadata hosts
-blocked, 403), 30s upstream timeout, `X-Request-ID` on every response,
-`Set-Cookie` and forwarding headers stripped.
+Other behaviour: SSRF guard (http(s) only; localhost, loopback, private
+ranges, link-local, `.local`, cloud metadata hosts blocked, 403), 30s
+upstream timeout, `X-Request-ID` on every response, `Set-Cookie` and
+forwarding headers stripped.
 
-## Deploy
+## Security
 
-Secrets live in Replit Secrets on repl-14 (`CLOUDFLARE_API_TOKEN`,
-`CLOUDFLARE_ACCOUNT_ID`). The `replit` CLI is at
-`/nix/store/*-replit-cli-*/bin/replit` (not on PATH). Re-stage this dir
-to repl-14, then:
+- The master key is the admin credential. Anyone holding it can use the
+  Worker and revoke tokens. Keep it out of the repo (`.gitignore` covers
+  `.proxy-key`), out of `/tmp` (wiped on redeploy), and rotate it with
+  `wrangler secret put PROXY_KEY` if it leaks.
+- User tokens are minted open — the Worker URL itself is the only
+  obscurity, so keep it unlisted; revoke any token that gets abused.
+- Never put a key or token in the URL — auth is the `X-Proxy-Key`
+  header only.
 
-```sh
-# once: create the KV namespace (tokens + cache), put its id in wrangler.toml
-replit secrets exec --keys CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID -- npx wrangler kv namespace create KV
+## Limits & roadmap
 
-replit secrets exec --keys CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID -- bash deploy.sh
-```
-
-`deploy.sh` installs wrangler, generates `.proxy-key` if missing
-(600, never printed), sets it as the Worker secret `PROXY_KEY`,
-and deploys.
-
-## Key
-
-The master key is the admin credential. Anyone holding it can use the
-Worker and revoke tokens. Keep it out of the repo (`.gitignore` covers
-`.proxy-key`), out of `/tmp` (wiped on redeploy), and rotate it with
-`wrangler secret put PROXY_KEY` if it leaks. User tokens are minted
-open — the Worker URL itself is the only obscurity, so keep it
-unlisted; revoke any token that gets abused.
-
-## Notes (verified 2026-11-13)
-
-- Shell `curl` through the platform proxy never triggers approval
-  cards — for any host, fresh or not. Approvals are per-tool/binary:
-  `node fetch` to a fresh host raised a card; curl/python/wget did not.
-- Some hosts block Cloudflare Workers IPs (news.ycombinator.com 419,
-  api.github.com 403, gnu.org 502/timeout) while direct curl passes.
-- HTTPS-via-SOCKS5 is not possible from a Worker (`startTls()` takes no
-  arguments; SNI is pinned to the proxy socket), so the fix for
-  CF-IP-blocked HTTPS destinations is a relay, not a SOCKS5 header.
-- Custom domain `<your-domain>` attached 2026-11-13 (Workers custom domain; cert auto-provisioned).
+- Some hosts block Cloudflare Workers IPs (HTTP 403/419, or a timeout)
+  while a direct fetch passes. HTTPS-via-SOCKS5 is not possible from a
+  Worker (`startTls()` takes no arguments; SNI is pinned to the proxy
+  socket), so the fix for CF-IP-blocked HTTPS destinations is a relay,
+  not a SOCKS5 header: the Worker fetches through a relay on a clean IP
+  and caches the result in KV. The intended relay is your own VLESS VPN
+  on a VPS; that is the next step, not yet wired in.
+- Shell `curl` through a platform proxy never triggers approval cards
+  for any host; approvals are per-tool/binary (`node fetch` to a fresh
+  host raised one; curl/python/wget did not).
