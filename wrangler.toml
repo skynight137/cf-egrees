@@ -3,6 +3,10 @@ main = "worker.js"
 compatibility_date = "2026-11-13"
 workers_dev = true
 
+routes = [
+  { pattern = "<your-domain>", custom_domain = true },
+]
+
 [[kv_namespaces]]
 binding = "KV"
 id = "6b06ed232254447588bbd255ff505d0f"

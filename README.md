@@ -4,7 +4,7 @@ A private `?url=` fetch proxy running on Cloudflare Workers. One domain
 fronts all shell HTTP egress: clients ask the Worker for a target, the
 Worker fetches it server-side and streams the response back.
 
-Live: `https://cf-egress.skae.workers.dev` (Worker name `cf-egress`)
+Live: `https://<your-domain>` (Worker name `cf-egress`; `https://cf-egress.skae.workers.dev` also works)
 
 ## Auth — per-user tokens, not one shared key
 
@@ -16,20 +16,20 @@ secret) is admin: it fetches, lists tokens, and revokes.
 
 ```sh
 # mint a token (open, self-serve)
-curl -s -X POST "https://cf-egress.skae.workers.dev/register?name=alice"
+curl -s -X POST "https://<your-domain>/register?name=alice"
 # {"token":"...","name":"alice",...} — keep the token, it cannot be recovered
 
 # fetch with it (X-Proxy-Key header, never in the URL)
 curl -s -H "X-Proxy-Key: <token>" \
-  "https://cf-egress.skae.workers.dev/?url=https://example.com"
+  "https://<your-domain>/?url=https://example.com"
 
 # list your cached entries
-curl -s -H "X-Proxy-Key: <token>" "https://cf-egress.skae.workers.dev/list"
+curl -s -H "X-Proxy-Key: <token>" "https://<your-domain>/list"
 
 # admin: list tokens / revoke one (master key only)
-curl -s -H "X-Proxy-Key: <master>" "https://cf-egress.skae.workers.dev/list"
+curl -s -H "X-Proxy-Key: <master>" "https://<your-domain>/list"
 curl -s -X POST -H "X-Proxy-Key: <master>" \
-  -d '{"token":"<token>"}' "https://cf-egress.skae.workers.dev/revoke"
+  -d '{"token":"<token>"}' "https://<your-domain>/revoke"
 ```
 
 ## Cache — fresh by default, opt-in per request
@@ -40,11 +40,11 @@ response in KV for that long, then it is pruned (`expiration_ttl`).
 ```sh
 # cache 600s: first call MISS, next calls HIT until 600s pass
 curl -s -H "X-Proxy-Key: <token>" \
-  "https://cf-egress.skae.workers.dev/?url=https://example.com&cache=600"
+  "https://<your-domain>/?url=https://example.com&cache=600"
 
 # force fresh (same as default): ?cache=0 or omit it
 curl -s -H "X-Proxy-Key: <token>" \
-  "https://cf-egress.skae.workers.dev/?url=https://example.com&cache=0"
+  "https://<your-domain>/?url=https://example.com&cache=0"
 ```
 
 - `?cache=` is clamped to **1..86400** (max 1 day, hard cap). Invalid
@@ -101,4 +101,4 @@ unlisted; revoke any token that gets abused.
 - HTTPS-via-SOCKS5 is not possible from a Worker (`startTls()` takes no
   arguments; SNI is pinned to the proxy socket), so the fix for
   CF-IP-blocked HTTPS destinations is a relay, not a SOCKS5 header.
-- Custom domain `<your-domain>` not attached yet.
+- Custom domain `<your-domain>` attached 2026-11-13 (Workers custom domain; cert auto-provisioned).
