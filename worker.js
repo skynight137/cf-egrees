@@ -405,12 +405,16 @@ async function handleProxy(req, env) {
         // Global KV body copy (<=10 MB only) so a request landing on a
         // different colo still hits (Cache API is per-colo). This is the
         // cross-colo fallback; the Cache API copy is the fast path.
+        // Retention is 1 day (like the Cache API copy), NOT the freshness
+        // window — the copy must survive past freshness so it can serve
+        // STALE from any colo after the entry goes stale. Freshness is
+        // decided by the expiresAt inside the value, not by KV TTL.
         if (env.KV && buf.byteLength <= 10 * 1024 * 1024) {
           try {
             await env.KV.put(kvKey, JSON.stringify({
               status: res.status, headers: kept, body: bytesToB64(new Uint8Array(buf)),
               cachedAt: now, expiresAt: now + cacheS * 1000,
-            }), { expirationTtl: cacheS });
+            }), { expirationTtl: CACHE_API_MAX_AGE });
           } catch { /* KV body copy is best-effort */ }
         }
         // KV metadata index (for /list only — the Cache API cannot enumerate).
