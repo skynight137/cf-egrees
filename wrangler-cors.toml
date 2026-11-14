@@ -1,0 +1,27 @@
+# CORS variant of cf-egress: same code, same KV namespace, same
+# PROXY_KEY — but CORS_ENABLED=true, so the Worker answers OPTIONS
+# preflight and adds Access-Control-Allow-Origin to every response,
+# and browser apps can use it. The main deployment (wrangler.toml)
+# stays server-side only; the two variants are separate by design.
+#
+# Deploy: npx wrangler deploy --config wrangler-cors.toml
+# Secret: npx wrangler secret put PROXY_KEY --config wrangler-cors.toml
+#   (same PROXY_KEY value as the main worker — one token works on both,
+#   the cache is shared, a revocation applies to both).
+name = "cf-egress-cors"
+main = "worker.js"
+compatibility_date = "2026-11-13"
+workers_dev = true
+
+[vars]
+CORS_ENABLED = "true"
+
+# Custom domain (optional): uncomment and set YOUR domain. The repo ships
+# workers.dev-only; replace the placeholder with your own domain.
+# routes = [
+#   { pattern = "your-domain.example.com", custom_domain = true },
+# ]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "c3c14e221d4f468aa8d2bbb6e86e127f"

@@ -3,6 +3,12 @@ main = "worker.js"
 compatibility_date = "2026-11-13"
 workers_dev = true
 
+# CORS is OFF here (server-side variant). The browser variant lives in
+# wrangler-cors.toml (same code, CORS_ENABLED=true, name cf-egress-cors).
+# Do not flip this to true — the two variants stay separate by design.
+[vars]
+CORS_ENABLED = "false"
+
 # Custom domain (optional): uncomment and set YOUR domain. The repo ships
 # workers.dev-only; replace the placeholder with your own domain.
 # routes = [

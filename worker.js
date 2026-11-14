@@ -1,5 +1,14 @@
 // cf-egress v3: private ?url= fetch proxy with JWT tokens + Cache API cache.
 //
+// VARIANTS — one codebase, two deployments (do NOT mix behaviours):
+//   - cf-egress (wrangler.toml): server-side only, no CORS. Default.
+//   - cf-egress-cors (wrangler-cors.toml): same code/KV/PROXY_KEY, but
+//     CORS_ENABLED=true — answers OPTIONS preflight and adds
+//     Access-Control-Allow-Origin to every response, so browser apps
+//     can use it. Auth stays the X-Proxy-Key header in both variants
+//     (never a query param — that would leak the key into URLs/logs,
+//     the exact weakness corsproxy.io has). See README.md "Variants".
+//
 // Auth: X-Proxy-Key header.
 //   - Master key = PROXY_KEY Worker secret (admin: fetch + list + revoke).
 //   - User tokens: JWTs minted by POST /register (open, self-serve).
@@ -36,6 +45,51 @@ const MAX_CACHE_BYTES = 50 * 1024 * 1024; // Cache API policy cap (platform limi
 const CACHE_API_MAX_AGE = 86400; // retained in Cache API up to 1 day; our own expiresAt metadata controls freshness
 const JWT_EXP_S = 365 * 24 * 3600; // 1 year
 const CACHE_KEY_HOST = 'https://cf-egress-cache.local'; // synthetic host: Cache API key namespace (never fetched)
+
+// --- CORS variant (cf-egress-cors) ---
+// Enabled only when env.CORS_ENABLED === 'true' (wrangler-cors.toml).
+// When off (default, main deployment) nothing below runs and behaviour
+// is byte-identical to before. CORS headers are added per-request AFTER
+// cache retrieval, so an echoed Origin is never baked into a cached
+// entry. Allow-Headers is a fixed list (not an echo of
+// Access-Control-Request-Headers): the worker only reads x-proxy-key
+// from the browser, so reflecting arbitrary requested headers would
+// widen the surface for nothing.
+const CORS_ALLOW_HEADERS = 'x-proxy-key, content-type, authorization, accept, accept-language';
+const CORS_EXPOSE_HEADERS = 'x-request-id, x-cache, x-cache-age, x-cache-expires';
+const CORS_ALLOW_METHODS = 'GET, POST, OPTIONS';
+const CORS_MAX_AGE = '86400';
+
+function corsEnabled(env) {
+  return env.CORS_ENABLED === 'true';
+}
+
+// OPTIONS preflight, any path: 204 + CORS headers. Origin is echoed
+// (or * when absent); Vary: Origin keeps caches honest.
+function handlePreflight(req) {
+  const origin = req.headers.get('origin') || '*';
+  return new Response(null, {
+    status: 204,
+    headers: {
+      'access-control-allow-origin': origin,
+      'vary': 'Origin',
+      'access-control-allow-methods': CORS_ALLOW_METHODS,
+      'access-control-allow-headers': CORS_ALLOW_HEADERS,
+      'access-control-max-age': CORS_MAX_AGE,
+    },
+  });
+}
+
+// Add CORS response headers to a freshly-built response (all our
+// responses are new Response() objects, so headers are mutable).
+// Appends to an existing Vary instead of clobbering the upstream one.
+function addCorsHeaders(resp, req) {
+  resp.headers.set('access-control-allow-origin', req.headers.get('origin') || '*');
+  const vary = resp.headers.get('vary');
+  resp.headers.set('vary', vary ? vary + ', Origin' : 'Origin');
+  resp.headers.set('access-control-expose-headers', CORS_EXPOSE_HEADERS);
+  return resp;
+}
 
 function blocked(url) {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return 'scheme not allowed';
@@ -450,22 +504,29 @@ async function handleProxy(req, env) {
 
 export default {
   async fetch(req, env) {
+    // CORS variant: answer preflight before routing, on any path.
+    if (corsEnabled(env) && req.method === 'OPTIONS') {
+      return handlePreflight(req);
+    }
+    let resp;
     const u = new URL(req.url);
     if (u.pathname === '/health') {
-      return json({ ok: true });
+      resp = json({ ok: true });
+    } else if (u.pathname === '/register' && req.method === 'POST') {
+      resp = await handleRegister(req, env);
+    } else if (u.pathname === '/list' && req.method === 'GET') {
+      resp = await handleList(req, env);
+    } else if (u.pathname === '/revoke' && req.method === 'POST') {
+      resp = await handleRevoke(req, env);
+    } else if (u.pathname === '/' && u.searchParams.has('url')) {
+      resp = await handleProxy(req, env);
+    } else {
+      resp = json({ error: 'not found' }, 404);
     }
-    if (u.pathname === '/register' && req.method === 'POST') {
-      return handleRegister(req, env);
-    }
-    if (u.pathname === '/list' && req.method === 'GET') {
-      return handleList(req, env);
-    }
-    if (u.pathname === '/revoke' && req.method === 'POST') {
-      return handleRevoke(req, env);
-    }
-    if (u.pathname === '/' && u.searchParams.has('url')) {
-      return handleProxy(req, env);
-    }
-    return json({ error: 'not found' }, 404);
+    // CORS variant: add per-request CORS headers AFTER cache retrieval
+    // (an echoed Origin must never be baked into a cached entry).
+    // When CORS is off this block never runs — main behaviour unchanged.
+    if (corsEnabled(env)) resp = addCorsHeaders(resp, req);
+    return resp;
   },
 };

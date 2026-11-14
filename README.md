@@ -7,6 +7,39 @@ Default is a fresh fetch every time; `?cache=` opts into caching.
 Live URL: `https://<your-domain>` (Worker `https://<your-worker>.workers.dev`
 also works). Replace both placeholders with your own domain / Worker name.
 
+## Variants — server-side vs browser (separate deployments, one codebase)
+
+Same `worker.js`, same KV namespace, same `PROXY_KEY` — so one token
+works on both, the cache is shared, and a revocation applies to both.
+What differs is only the CORS behaviour, picked by `CORS_ENABLED`:
+
+| Variant | Config | CORS | Use for |
+|---|---|---|---|
+| `cf-egress` | `wrangler.toml` (`CORS_ENABLED=false`) | none — no preflight, no `Access-Control-Allow-Origin` | server-side: shell, curl, tools, Muse |
+| `cf-egress-cors` | `wrangler-cors.toml` (`CORS_ENABLED=true`) | OPTIONS preflight (204) + `Access-Control-Allow-Origin` (Origin echoed, `Vary: Origin`) + `Access-Control-Expose-Headers: x-request-id, x-cache, x-cache-age, x-cache-expires` on every response | browser apps |
+
+They are separate on purpose: a browser needs preflight + CORS
+headers, a server-side client must never get them (and a CORS
+deployment must never leak behaviour into the server-side one).
+Auth is the `X-Proxy-Key` header in **both** variants — never a query
+param (a key in the URL shows up in history, logs and Referer; that is
+the exact weakness corsproxy.io has). The preflight handler is what
+makes the header usable from a browser: it answers OPTIONS with
+`Access-Control-Allow-Headers: x-proxy-key, content-type, authorization,
+accept, accept-language` (fixed list, not an echo of the requested
+headers) and `Access-Control-Max-Age: 86400`.
+
+Deploy each variant separately (same `PROXY_KEY` secret value on both):
+
+```sh
+npx wrangler deploy                                   # cf-egress (server-side)
+npx wrangler deploy --config wrangler-cors.toml       # cf-egress-cors (browser)
+npx wrangler secret put PROXY_KEY --config wrangler-cors.toml  # same key as main
+```
+
+CORS headers are added per-request **after** cache retrieval, so an
+echoed Origin is never baked into a cached entry.
+
 ## Setup
 
 1. `wrangler kv namespace create KV` — put the id in `wrangler.toml`.
