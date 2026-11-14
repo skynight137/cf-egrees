@@ -3,10 +3,12 @@ main = "worker.js"
 compatibility_date = "2026-11-13"
 workers_dev = true
 
-routes = [
-  { pattern = "<your-domain>", custom_domain = true },
-]
+# Custom domain (optional): uncomment and set YOUR domain. The repo ships
+# workers.dev-only; replace the placeholder with your own domain.
+# routes = [
+#   { pattern = "your-domain.example.com", custom_domain = true },
+# ]
 
 [[kv_namespaces]]
 binding = "KV"
-id = "6b06ed232254447588bbd255ff505d0f"
+id = "c3c14e221d4f468aa8d2bbb6e86e127f"

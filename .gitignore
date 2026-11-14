@@ -3,3 +3,5 @@ node_modules/
 .proxy-key
 .dev.vars
 *.log
+# Personal deploy helper (Replit-specific, not for the public repo)
+deploy.sh
