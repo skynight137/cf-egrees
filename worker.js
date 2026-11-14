@@ -14,15 +14,17 @@
 //   - Cached data expires per ?cache=.
 //
 // Cache: default is ALWAYS FRESH fetch. Add ?cache=<seconds> to cache the
-//   response in the Workers Cache API (caches.default) for that long
-//   (1..86400, clamped; 0 or absent = fresh). ?cache=0 forces fresh.
-//   Only GET 2xx responses <= 50 MB, without Set-Cookie, are cached.
-//   Cache is per-token (keyed by token hash), never shared.
+//   response for that long (1..86400, clamped; 0 or absent = fresh).
+//   ?cache=0 forces fresh. Only GET 2xx responses <= 50 MB, without
+//   Set-Cookie, are cached. Cache is per-token (keyed by token hash),
+//   never shared. Bodies live in the Workers Cache API (edge-local, fast
+//   path) AND, when <= 10 MB, in KV (global cross-colo fallback — the
+//   Cache API is per-colo, and measured hit rate was only ~40% when
+//   requests arrive via many colos; the KV copy restores ~100%).
 //   On upstream failure (RTO/timeout) a cached copy is served instead
 //   (X-Cache: STALE) when one exists. A lightweight KV metadata index
 //   (cachemeta:<tokenId16>:<urlSha>) keeps /list working (the Cache API
-//   cannot enumerate entries). Old v2 KV cache bodies (cache:<...>) are
-//   orphaned and expire on their own; they are never read by v3.
+//   cannot enumerate entries).
 //
 // Endpoints: GET /health (open), POST /register (open), GET /list (auth),
 //   POST /revoke (admin), GET /?url=<target>[&cache=<s>] (auth).
@@ -192,6 +194,24 @@ function serveCached(cachedRes, state, meta) {
   return new Response(cachedRes.body, { status: cachedRes.status, headers });
 }
 
+// Serve a v2-format KV body (the global cross-colo fallback).
+function serveKvBody(entry, state) {
+  const headers = new Headers();
+  for (const h of ['content-type', 'content-encoding', 'content-disposition']) {
+    if (entry.headers[h]) headers.set(h, entry.headers[h]);
+  }
+  headers.set('x-request-id', crypto.randomUUID());
+  headers.set('x-cache', state);
+  headers.set('x-cache-age', String(Math.max(0, Math.floor((Date.now() - entry.cachedAt) / 1000))));
+  headers.set('x-cache-expires', new Date(entry.expiresAt).toISOString());
+  return new Response(b64ToBytes(entry.body), { status: entry.status, headers });
+}
+
+// KV body key (v2 format) — the global cross-colo fallback copy.
+function kvBodyKey(tokenId, urlSha) {
+  return 'cache:' + tokenId.slice(0, 16) + ':' + urlSha;
+}
+
 async function handleRegister(req, env) {
   let name = new URL(req.url).searchParams.get('name') || '';
   try {
@@ -251,7 +271,7 @@ async function handleRevoke(req, env) {
     const ttl = Math.max(1, (payload.exp || 0) - Math.floor(Date.now() / 1000));
     // Denylist entry lives until the token would have expired (KV needs >= 60s).
     await env.KV.put('revoked:' + payload.sub, JSON.stringify({ name: payload.name || null, revokedAt: Date.now() }), { expirationTtl: Math.max(60, ttl) });
-    // Delete its cached bodies (via the KV metadata index) + the index.
+    // Delete its cached bodies (Cache API + KV body copy) via the KV metadata index.
     const prefix = 'cachemeta:' + payload.sub.slice(0, 16) + ':';
     const keys = await env.KV.list({ prefix });
     let deleted = 0;
@@ -259,6 +279,7 @@ async function handleRevoke(req, env) {
     for (const k of keys.keys) {
       const urlSha = k.name.slice(prefix.length);
       try { await cache.delete(cacheRequest(payload.sub, urlSha)); } catch { /* best effort */ }
+      try { await env.KV.delete(kvBodyKey(payload.sub, urlSha)); } catch { /* best effort */ }
       await env.KV.delete(k.name);
       deleted++;
     }
@@ -304,10 +325,14 @@ async function handleProxy(req, env) {
   const urlSha = await sha256Hex(t.toString());
   const cReq = cacheRequest(who.tokenId, urlSha);
   const cache = caches.default;
+  const kvKey = kvBodyKey(who.tokenId, urlSha);
 
-  // Freshness check against the Cache API copy (if any).
+  // Freshness check. Cache API is per-colo, so a miss there falls back
+  // to the global KV copy (measured: Cache API alone gives ~40% hit
+  // rate when requests arrive via many colos; KV restores ~100%).
   let staleRes = null;
   let staleMeta = null;
+  let staleKv = null;
   if (wantCache) {
     const hit = await cache.match(cReq);
     if (hit) {
@@ -316,6 +341,25 @@ async function handleProxy(req, env) {
       // Stale copy: keep it in hand — it becomes STALE if the fresh fetch fails.
       staleRes = hit;
       staleMeta = meta;
+    }
+    // KV fallback (global): fresh entry here is a HIT, and we repopulate
+    // this colo's Cache API so the next request here hits edge-local.
+    if (env.KV) {
+      const kvHit = await env.KV.get(kvKey, 'json');
+      if (kvHit && Date.now() < kvHit.expiresAt) {
+        try {
+          const repHeaders = new Headers();
+          for (const h of ['content-type', 'content-encoding', 'content-disposition']) {
+            if (kvHit.headers[h]) repHeaders.set(h, kvHit.headers[h]);
+          }
+          repHeaders.set('cache-control', 'max-age=' + CACHE_API_MAX_AGE);
+          repHeaders.set('x-cf-egress-cached-at', String(kvHit.cachedAt));
+          repHeaders.set('x-cf-egress-expires-at', String(kvHit.expiresAt));
+          await cache.put(cReq, new Response(b64ToBytes(kvHit.body), { status: kvHit.status, headers: repHeaders }));
+        } catch { /* repopulation is best-effort */ }
+        return serveKvBody(kvHit, 'HIT');
+      }
+      if (kvHit) staleKv = kvHit; // stale KV copy: STALE fallback if the fetch fails
     }
   }
 
@@ -358,6 +402,17 @@ async function handleProxy(req, env) {
         try {
           await cache.put(cReq, new Response(buf, { status: res.status, headers: storeHeaders }));
         } catch { /* cache put is best-effort; the live response still goes out */ }
+        // Global KV body copy (<=10 MB only) so a request landing on a
+        // different colo still hits (Cache API is per-colo). This is the
+        // cross-colo fallback; the Cache API copy is the fast path.
+        if (env.KV && buf.byteLength <= 10 * 1024 * 1024) {
+          try {
+            await env.KV.put(kvKey, JSON.stringify({
+              status: res.status, headers: kept, body: bytesToB64(new Uint8Array(buf)),
+              cachedAt: now, expiresAt: now + cacheS * 1000,
+            }), { expirationTtl: cacheS });
+          } catch { /* KV body copy is best-effort */ }
+        }
         // KV metadata index (for /list only — the Cache API cannot enumerate).
         if (env.KV) {
           try {
@@ -378,22 +433,12 @@ async function handleProxy(req, env) {
     return new Response(res.body, { status: res.status, headers });
   } catch (e) {
     // RTO / network failure: serve the cached copy when one exists.
+    // Prefer the edge-local Cache API copy, fall back to the global KV copy.
     if (staleRes) return serveCached(staleRes, 'STALE', staleMeta);
-    // No Cache API copy: fall back to a v2 KV body if one still exists
-    // (migration window only — v3 never writes KV bodies).
+    if (staleKv) return serveKvBody(staleKv, 'STALE');
     if (env.KV) {
-      const old = await env.KV.get('cache:' + who.tokenId.slice(0, 16) + ':' + urlSha, 'json');
-      if (old) {
-        const headers = new Headers();
-        for (const h of ['content-type', 'content-encoding', 'content-disposition']) {
-          if (old.headers[h]) headers.set(h, old.headers[h]);
-        }
-        headers.set('x-request-id', crypto.randomUUID());
-        headers.set('x-cache', 'STALE');
-        headers.set('x-cache-age', String(Math.max(0, Math.floor((Date.now() - old.cachedAt) / 1000))));
-        headers.set('x-cache-expires', new Date(old.expiresAt).toISOString());
-        return new Response(b64ToBytes(old.body), { status: old.status, headers });
-      }
+      const old = await env.KV.get(kvKey, 'json');
+      if (old) return serveKvBody(old, 'STALE');
     }
     return json({ error: 'upstream fetch failed', detail: String(e).slice(0, 120) }, 502);
   }

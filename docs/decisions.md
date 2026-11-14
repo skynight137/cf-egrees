@@ -22,13 +22,21 @@ small metadata index (for `/list`, which the Cache API cannot enumerate).
   followed by a read on the same colo is consistent.
 
 **Trade-off:** the Cache API is per-colo, not global — a cache MISS on a
-different colo re-fetches. For a personal proxy this is fine (traffic
-comes from a few colos). The KV metadata index is still a KV write per
-cache-store (metadata only, ~200 bytes), so `/list` keeps working.
+different colo re-fetches. **Measured 2026-11-14:** requests from one
+client arrived via many US colos (SJC, SEA, LAX, EWR, ORD, ATL); Cache
+API alone gave ~40% hit rate (a colo only HITs if it cached the entry).
+That is a real regression vs KV's global hit rate, so v3 is a **hybrid**:
+bodies are stored in BOTH the Cache API (edge-local fast path, up to
+50 MB) AND KV (global cross-colo fallback, up to 10 MB, v2 body format).
+Lookup order is Cache API first, then KV (and a KV hit repopulates the
+local colo's Cache API). STALE falls back the same way. The KV body copy
+is the price of a global hit rate; the Cache API copy is the price of
+edge-local speed. Both are written on a cache-store; either may serve.
 
 **What would change it:** if cache hit rate across colos proves too low
 (measured — see the v3 report), move the metadata index to a global
-store or accept KV for bodies again.
+store or accept KV for bodies again. (Measured: hybrid restores ~100%
+hit rate after the first MISS warms KV globally.)
 
 ## 2. Tokens: stateless JWT (HMAC-SHA256, WebCrypto), NOT KV records
 
@@ -101,11 +109,14 @@ The `BYPASS` branch is the single place to hook that in.
 
 ## 5. KV: what remains, and how it is tuned
 
-KV is still used for three small things:
+KV is still used for four small things:
 - `revoked:<tokenId>` — the revocation denylist (auto-expires at the
   token's expiry; see §2).
 - `cachemeta:<tokenId16>:<urlSha>` — the cache metadata index for
   `/list` (auto-expires at the cache TTL).
+- `cache:<tokenId16>:<urlSha>` — the global cross-colo body copy (v2
+  format, <=10 MB only; see §1). This is what makes the hit rate
+  global despite the Cache API being per-colo.
 - `token:<sha256>` — legacy token records (v2 fallback only; no new
   writes).
 
